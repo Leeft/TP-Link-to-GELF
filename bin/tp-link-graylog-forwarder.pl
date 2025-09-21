@@ -4,157 +4,22 @@
 use utf8;
 use strict;
 use warnings;
-use feature 'say';
+use feature qw( say state );
 use Socket;
 use IO::Select;
 use Data::Printer;
 use Try::Tiny;
-use Compress::Zlib;
 use JSON::XS;
+use Readonly;
+use FindBin;
+use lib "$FindBin::Bin/../lib/";
+use TPLinkSyslogMessage::Parser;
 
 # --- Configuration ---
 my $GRAYLOG_PORT    = $ENV{ GRAYLOG_PORT } // 12201;  # Graylog's default GELF TCP port
 my $GRAYLOG_IP      = $ENV{ GRAYLOG_IP }   || die "Specify GRAYLOG_IP for the address to send to";
 
-my $LOG_LEVEL       = 6;         # Default GELF level (6=Informational, 7=Debug, etc.)
-# TODO: Can further improve this with the data parsed from the messages
-
-# 6.2.1.  PRI
-#
-#    The PRI part MUST have three, four, or five characters and will be
-#    bound with angle brackets as the first and last characters.  The PRI
-#    part starts with a leading "<" ('less-than' character, %d60),
-#    followed by a number, which is followed by a ">" ('greater-than'
-#    character, %d62).  The number contained within these angle brackets
-#    is known as the Priority value (PRIVAL) and represents both the
-#    Facility and Severity.  The Priority value consists of one, two, or
-#    three decimal integers (ABNF DIGITS) using values of %d48 (for "0")
-#    through %d57 (for "9").
-#
-#    Facility and Severity values are not normative but often used.  They
-#    are described in the following tables for purely informational
-#    purposes.  Facility values MUST be in the range of 0 to 23 inclusive.
-#
-#           Numerical             Facility
-#              Code
-#
-#               0             kernel messages
-#               1             user-level messages
-#               2             mail system
-#               3             system daemons
-#               4             security/authorization messages
-#               5             messages generated internally by syslogd
-#               6             line printer subsystem
-#               7             network news subsystem
-#               8             UUCP subsystem
-#               9             clock daemon
-#              10             security/authorization messages
-#              11             FTP daemon
-#              12             NTP subsystem
-#              13             log audit
-#              14             log alert
-#              15             clock daemon (note 2)
-#              16             local use 0  (local0)
-#              17             local use 1  (local1)
-#              18             local use 2  (local2)
-#              19             local use 3  (local3)
-#              20             local use 4  (local4)
-#              21             local use 5  (local5)
-#              22             local use 6  (local6)
-#              23             local use 7  (local7)
-#
-#               Table 1.  Syslog Message Facilities
-#
-#    Each message Priority also has a decimal Severity level indicator.
-#    These are described in the following table along with their numerical
-#    values.  Severity values MUST be in the range of 0 to 7 inclusive.
-#
-#            Numerical         Severity
-#              Code
-#
-#               0       Emergency: system is unusable
-#               1       Alert: action must be taken immediately
-#               2       Critical: critical conditions
-#               3       Error: error conditions
-#               4       Warning: warning conditions
-#               5       Notice: normal but significant condition
-#               6       Informational: informational messages
-#               7       Debug: debug-level messages
-#
-#               Table 2. Syslog Message Severities
-#
-#    The Priority value is calculated by first multiplying the Facility
-#    number by 8 and then adding the numerical value of the Severity.  For
-#    example, a kernel message (Facility=0) with a Severity of Emergency
-#    (Severity=0) would have a Priority value of 0.  Also, a "local use 4"
-#    message (Facility=20) with a Severity of Notice (Severity=5) would
-#    have a Priority value of 165.  In the PRI of a syslog message, these
-#    values would be placed between the angle brackets as <0> and <165>
-#    respectively.  The only time a value of "0" follows the "<" is for
-#    the Priority value of "0".  Otherwise, leading "0"s MUST NOT be used.
-#
-# 6.2.2.  VERSION
-#
-#    The VERSION field denotes the version of the syslog protocol
-#    specification.  The version number MUST be incremented for any new
-#    syslog protocol specification that changes any part of the HEADER
-#    format.  Changes include the addition or removal of fields, or a
-#    change of syntax or semantics of existing fields.  This document uses
-#    a VERSION value of "1".  The VERSION values are IANA-assigned
-#    (Section 9.1) via the Standards Action method as described in
-#    [RFC5226].
-
-# "AP MAC" messages consist of multiple lines, which aren't that useful in a pack.
-# They're also not that easily parsed to something graylog can work with with.
-# This regex matches the first of one of these multiline messages.
-my $FIRST_LINE_REGEX = qr{
-    ^
-       \< (?<facility> ( [0-9] | [12][0-9] | 2[0-3] ) (?<priority> [0-7])) \> (?<version> \d+)? \s+
-        ( (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \s+ \d+ \s+ [0-9]{2}:[0-9]{2}:[0-9]{2}) \s+
-        ( [0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3} ) \s+
-        \[ (?<timestamp> \d+ [.] \d+ ) \] \s+
-        (?<rest> AP \s MAC= .* )
-    $
-}xo;
-
-# And this one matches additional lines while there are any.
-my $ADDITIONAL_LINE_REGEX = qr{
-    ^
-        \[ (?<timestamp> \d+ [.] \d+ ) \] \s+
-        (?<rest> (?:AP\s+) MAC= .* )
-    $
-}xo;
-
-my $CONTROLLER_DHCP_INFO_REGEX = qr{
-    ^
-       \< (?<facility> ( [0-9] | [12][0-9] | 2[0-3] ) (?<priority> [0-7])) \> (?<version> \d+)? \s+
-        ( [0-9]{4}-[0-9]{2}-[0-9]{2} \s+ [0-9]{2}:[0-9]{2}:[0-9]{2} ) \s+
-        (?<origin> \S+) \s+ (?<appname>(-|\S+)) \s+ (?<procid>(-|\S+)) \s+ (?<msgid>(-|\S+)) \s+
-        (?<rest>.*)
-    $
-}xo;
-
-my $CONTROLLER_OPERATION_INFO_REGEX = qr{
-    ^
-       \< (?<facility> ( [0-9] | [12][0-9] | 2[0-3] ) (?<priority> [0-7])) \> (?<version> \d+)? \s+
-        ( [0-9]{4}-[0-9]{2}-[0-9]{2} \s+ [0-9]{2}:[0-9]{2}:[0-9]{2} ) \s+
-        (?<origin> \S+) \s+ (?<appname>(-|\S+)) \s+ (?<procid>(-|\S+)) \s+ (?<msgid>(-|\S+)) \s+
-        (?<json> \{ .* \} )
-    $
-}xo;
-
-# Regex to parse each individual line after splitting.
-# Using qr{} for pre-compilation and /x for readability.
-my $LINE_PARSE_REGEX = qr{
-    AP \s MAC =   (?<AP_MAC>[0-9a-fA-F:]{17}) \s+
-    MAC \s SRC =  (?<MAC_SRC>[0-9a-fA-F:]{17}) \s+
-    IP \s SRC =   (?<IP_SRC>[0-9.]{7,15}) \s+
-    IP \s DST =   (?<IP_DST>[0-9.]{7,15}) \s+
-    IP \s proto = (?<IP_PROTO>[0-9]+) \s+
-    SPT = (?<SPT>[0-9]+) \s+
-    DPT = (?<DPT>[0-9]+)
-}xo;
-
+my $DEFAULT_LOG_LEVEL = 6;         # Default GELF level (6=Informational, 7=Debug, etc.)
 
 my $listen_sock;
 
@@ -204,112 +69,67 @@ while ( my @ready_socks = $sel->can_read )
 
             # Basic validation: does it look like a TP-Link AP log line?
 
-            my %fields;
+            my $fields;
 
-            if ( $line =~ $FIRST_LINE_REGEX )
+            if ( my %result = match_first_line( $line ) )
             {
-                # Set %fields and %base_fields from the regex match.
-                %fields = %+;
-                %base_fields = %+;
-
-                $short_message = "TP-Link: $fields{rest}";
-                $fields{ category } = 'AP MAC';
+                $fields = fields_from_first_line_match( $line );
+                # Preserve the fields in base_fields for any subsequent lines.
+                %base_fields = %$fields;
             }
-            elsif ( $line =~ $ADDITIONAL_LINE_REGEX )
+            elsif ( %result = match_additional_line( $line ) )
             {
-                # Shallow copy of %base_fields to %fields
-                %fields = %base_fields;
-
-                # And replace those fields that occurred on the additional line.
-                foreach my $key ( keys %+ ) {
-                    $fields{ $key } = $+{ $key };
-                }
-
-                $short_message = "TP-Link: $fields{rest}";
-                $fields{ category } = 'AP MAC';
+                $fields = fields_from_additional_line_match( \%result, \%base_fields );
             }
-            elsif ( $line =~ $CONTROLLER_DHCP_INFO_REGEX )
+            elsif ( %result = match_dhcp_info( $line ) )
             {
-                # DHCP info message examples; these occor in a single message at a time
-                #
-                # <134>1 2025-07-19 19:21:46 Omada-Controller-XXXX-YYYYYYYYYY - - - 2.5G WAN1: DHCP client lease expired. Began renewing the lease.
-                # <134>1 2025-07-19 19:21:50 Omada-Controller-XXXX-YYYYYYYYYY - - - 2.5G WAN1: DHCP client renewing IP succeeded. (IP-Address=x.x.x.x, Mask=255.252.0.0, Gateway=x.x.x.x)
-                %fields = %base_fields;
-
-                foreach my $key ( keys %+ ) {
-                    $fields{ $key } = $+{ $key };
-                }
-
-                $short_message = "TP-Link DHCP: @{[ $fields{rest} || $line ]}";
-                $fields{ category } = 'DHCP';
+                $fields = fields_from_dhcp_info( \%result, $line );
             }
-            elsif ( $line =~ $CONTROLLER_OPERATION_INFO_REGEX )
+            elsif ( %result = match_controller_operation_info( $line ) )
             {
-                # Operational message examples. These occur in a single message at a time
-                # plus these contain a JSON payload, so that will be parsed as well and
-                # the separate fields from that can be sent to Graylog.
-                #
-                # <158>1 2025-07-19 23:00:18 Omada-Controller-XXXX - - - {"details":{},"operation":"****** logged in successfully."}
-                # <158>1 2025-07-19 18:18:23 Omada-Controller-XXXX - - - {"details":{},"operation":"Global Remote Logging configured successfully."}
-                # <158>1 2025-07-19 18:18:23 Omada-Controller-XXXX - - - {"details":{},"operation":"General Settings edited successfully."}
-                # <158>1 2025-07-19 18:18:23 Omada-Controller-XXXX - - - {"details":{},"operation":"Join User Experience Improvement Program edited successfully."}
-
-                %fields = %base_fields;
-
-                $fields{ origin } = $+{ origin };
-
-                my $json_deserializer = JSON->new->utf8->allow_nonref->canonical;
-                my $decoded = $json_deserializer->decode( $+{ json } );
-
-                foreach my $key ( keys %{ $decoded } ) {
-                    $fields{ $key } = $decoded->{ $key };
-                }
-
-                $short_message = "TP-Link OPERATION: @{[ $fields{operation} || $line ]}";
-                $fields{ category } = 'OPERATION';
+                $fields = fields_from_controller_operation_info( \%result, $line );
             }
             else
             {
                 # TODO: Implement additional parsing logic rather than just forwarding the message
                 # as-is to TP-Link. Can't do that until more have been discovered though.
-                say { *STDERR } "NO MATCH: $line";
-                $short_message = "TP-Link Unknown: $line";
-                $fields{ category } = 'UNPARSED';
+                say { *STDERR } "COULD NOT PARSE: $line";
+                $fields->{ short_message } = "TP-Link Unknown: $line";
+                $fields->{ category } = 'UNPARSED';
             }
 
             # The timestamp _must_ be a number, a string will not be accepted.
-            my $timestamp = 0 + ( $fields{ timestamp } || time() );
+            my $timestamp = 0 + ( $fields->{ timestamp } || time() );
 
             my %gelf_message = (
                 version       => "1.1",
                 host          => $sender_ip,
-                short_message => $short_message,
+                short_message => $fields->{ short_message },
                 full_message  => $line,
-                level         => $LOG_LEVEL,
+                level         => $fields->{ level } // $DEFAULT_LOG_LEVEL,
                 timestamp     => $timestamp,
-                _tp_link      => $fields{ category },
+                _tp_link      => $fields->{ category },
             );
 
             # No point repeating this data in the message
-            delete $fields{timestamp};
+            delete $fields->{ timestamp };
 
             # "rest" should be removed from the messages as well, and if not
             # set after parsing we'll use the original message.
-            my $rest = delete $fields{rest};
+            my $rest = delete $fields->{ rest };
                $rest ||= $line;
 
             # Add all parsed fields as custom GELF fields (thus prefixed with '_')
-            while ( my ($key, $val) = each %fields) {
+            while ( my ($key, $val) = each %$fields) {
                 $gelf_message{"_$key"} = $val;
             }
 
-            if ( $rest =~ $LINE_PARSE_REGEX )
+            if ( $rest and my $dhcp = match_dhcp_fields( $rest ) )
             {
                 # If the message has specific fields, parse thos
                 # and set the fields for graylog to use. Again as custom
                 # fields.
-                my %parsed_fields = %+;
-                while ( my ($key, $val) = each %parsed_fields ) {
+                while ( my ($key, $val) = each %$dhcp ) {
                     $gelf_message{"_$key"} = $val;
                 }
             }
@@ -317,28 +137,15 @@ while ( my @ready_socks = $sel->can_read )
             # Now attempt to deliver to Graylog. If that fails, log to STDOUT.
             try
             {
-                send_gelf_message( \%gelf_message );
+                send_gelf_message( \%gelf_message, $GRAYLOG_IP, $GRAYLOG_PORT );
             }
             catch
             {
                 my $err = $_;
-                say { *STDERR } "$err: ".np( %gelf_message );
+                say { *STDERR } "COULD NOT SEND TO GELF ENDPOINT: $err: ".np( %gelf_message );
             };
         }
     }
 }
-
-sub send_gelf_message {
-    my $gelf_data = shift;
-
-    my $json_str = $json_serializer->encode( $gelf_data );
-    my $compressed_data = compress( $json_str, Z_DEFAULT_COMPRESSION );
-
-    # Create a temporary socket to send UDP
-    socket( my $sock, PF_INET, SOCK_DGRAM, getprotobyname('udp') ) or die "socket: $!";
-    my $dest_addr = sockaddr_in( $GRAYLOG_PORT, inet_aton( $GRAYLOG_IP ) );
-    send( $sock, $compressed_data, 0, $dest_addr ) or warn "send GELF: $!";
-    close( $sock );
-}
-
+   
 # EOF
