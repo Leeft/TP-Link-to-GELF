@@ -33,7 +33,7 @@ pct exec $CTID -- apt-get install -y --no-install-recommends \
 # Copy the Perl script from Proxmox host to container
 pct exec $CTID -- mkdir -p /opt/lib/TPLinkSyslogMessage
 pct exec $CTID -- wget -O /opt/tp-link-graylog-forwarder.pl https://raw.githubusercontent.com/Leeft/TP-Link-to-GELF/refs/heads/main/bin/tp-link-graylog-forwarder.pl
-pct exec $CTID -- wget -O /opt/lib/TPLinkSyslogMessage/Parser.pm https://raw.githubusercontent.com/Leeft/TP-Link-to-GELF/refs/heads/main/lib/TPLinkSyslogMessage/Parser.pl
+pct exec $CTID -- wget -O /opt/lib/TPLinkSyslogMessage/Parser.pm https://raw.githubusercontent.com/Leeft/TP-Link-to-GELF/refs/heads/main/lib/TPLinkSyslogMessage/Parser.pm
 
 # --- SET ENVIRONMENT VARIABLES ---
 pct set $CTID -env GRAYLOG_IP=$GRAYLOG_IP
