@@ -12,7 +12,7 @@ use Try::Tiny;
 use JSON::XS;
 use Readonly;
 use FindBin;
-use lib "$FindBin::Bin/../lib/";
+use lib ( "$FindBin::Bin/../lib/", "$FindBin::Bin/lib/" );
 use TPLinkSyslogMessage::Parser;
 
 # --- Configuration ---
@@ -73,7 +73,7 @@ while ( my @ready_socks = $sel->can_read )
 
             if ( my %result = match_first_line( $line ) )
             {
-                $fields = fields_from_first_line_match( $line );
+                $fields = fields_from_first_line_match( $line, \%result );
                 # Preserve the fields in base_fields for any subsequent lines.
                 %base_fields = %$fields;
             }

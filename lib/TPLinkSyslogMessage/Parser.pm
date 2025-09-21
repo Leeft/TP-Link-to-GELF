@@ -165,7 +165,7 @@ sub match_dhcp_fields {
 }
 
 sub fields_from_first_line_match {
-    my ( $line, $result ) = shift;
+    my ( $line, $result ) = ( shift, shift );
 
     # Set %fields from the regex match.
     my %fields = %$result;
